@@ -1,0 +1,852 @@
+// ==== RSS -> Blogger (REST) com FILA LEVE + PUBLICAÇÃO FIXA POR EXECUÇÃO ====
+// Objetivo: publicar ATÉ N (CAP_PER_RUN) matérias por execução (round-robin entre feeds).
+// Extrator por domínio + limpeza agressiva + correção de imagens lazy (data-src → src) + vídeos como links/embeds.
+// Ao 1º quotaExceeded (403), aplica backoff exponencial, repõe o restante e encerra.
+// ------------------------------------------------------------------------------
+'use strict';
+
+/** CONFIG BÁSICA **/
+var BLOG_ID      = (typeof BLOG_ID      !== 'undefined') ? BLOG_ID      : '8996704521054251806';
+var BLOG_URL     = (typeof BLOG_URL     !== 'undefined') ? BLOG_URL     : 'https://www.opiniaonamesa.com';
+var PUBLISH_MODE = (typeof PUBLISH_MODE !== 'undefined') ? PUBLISH_MODE : 'publish'; // 'publish' | 'draft'
+
+/** FEEDS a coletar (adicionado Minuto Barra) **/
+var FEED_LIST = [
+  'https://domingoscosta.com.br/feed/',
+  'https://imaranhao.com.br/feed/',
+  'https://minutobarra.com.br/feed/'
+];
+
+/** Quantidade fixa por execução **/
+var CAP_PER_RUN = 5;
+
+/** Pausa entre publicações (ajuda contra limites de janela curta) **/
+var PER_ITEM_PAUSE_MS = 3000; // 3s
+
+/** Limite diário global (0 = desativado) **/
+var MAX_POSTS_PER_DAY = 80;
+
+/** Fila leve e teto **/
+var QUEUE_MAX_ITEMS = 300; // máximo de itens na fila
+
+/** Backoff para quotaExceeded **/
+var QUOTA_BACKOFF_START_MS = 60 * 60 * 1000;      // 60 min
+var QUOTA_BACKOFF_MAX_MS   = 6  * 60 * 60 * 1000; // 6 h
+
+/** Base da API **/
+var BLOGGER_API_BASE = 'https://www.googleapis.com/blogger/v3';
+
+/** KEYS Propriedades **/
+var KEY_QUEUE           = 'queueJson';
+var KEY_SENT_PREF       = 'sent:';             // sent:<guid>
+var KEY_NEXT_ALLOWED    = 'nextAllowedAt';     // ms (cooldown por quotaExceeded)
+var KEY_BACKOFF_MS      = 'quotaBackoffMs';
+var KEY_DAY_COUNT_PREF  = 'dayCount:';         // dayCount:YYYY-MM-DD
+var KEY_ROTATE_FEED     = 'rotateFeed';        // índice do próximo feed p/ round-robin
+
+// ===================== INÍCIO RÁPIDO =====================
+function runOnce() {
+  log('INÍCIO runOnce');
+  enqueueFromFeeds();
+  processQueueOnce();
+  log('FIM runOnce');
+}
+
+// ===================== ENFILEIRAR (FILA LEVE) =====================
+function enqueueFromFeeds() {
+  var store = PropertiesService.getScriptProperties();
+  var added = 0;
+
+  for (var i = 0; i < FEED_LIST.length; i++) {
+    var feedUrl = FEED_LIST[i];
+    var entries = fetchFeedEntries(feedUrl);
+    log('Feed:', feedUrl, '→ itens:', entries.length);
+
+    for (var j = 0; j < entries.length; j++) {
+      var e = entries[j];
+      var guid = e.id || e.link;
+      if (!guid) {
+        log('Item sem GUID/link descartado:', e.title || 'Sem título');
+        continue;
+      }
+      if (store.getProperty(KEY_SENT_PREF + guid)) {
+        log('Item já publicado:', guid);
+        continue;
+      }
+      if (queueHas(guid)) {
+        log('Item já na fila:', guid);
+        continue;
+      }
+
+      // Fila leve: guarda só meta; HTML será montado na hora de publicar
+      var title = safeTitle(e.title || 'Sem título');
+      var link  = e.link || '';
+      queuePush({ guid: guid, title: title, link: link, feed: feedUrl });
+      added++;
+    }
+  }
+  log('Itens adicionados à fila (leve):', added, '| Fila agora:', queueSize());
+  return added;
+}
+
+// ===================== PUBLICAÇÃO (ATÉ CAP_PER_RUN) =====================
+function processQueueOnce() {
+  var lock = LockService.getScriptLock();
+  if (!tryLock(lock, 20000)) { log('Sem lock. Saindo.'); return; }
+
+  try {
+    var store = PropertiesService.getScriptProperties();
+    var now = Date.now();
+
+    // Cooldown por quotaExceeded
+    var nextAllowed = Number(store.getProperty(KEY_NEXT_ALLOWED) || '0');
+    if (nextAllowed && now < nextAllowed) {
+      log('Em cooldown por quotaExceeded até', new Date(nextAllowed).toISOString());
+      return; // o gatilho de 1h chamará novamente
+    }
+
+    // Garante itens na fila
+    var q = queueLoad();
+    if (!q.length) {
+      log('Fila vazia → rodando enqueueFromFeeds()');
+      enqueueFromFeeds();
+      q = queueLoad();
+      if (!q.length) { log('Sem itens após novo enqueue.'); return; }
+    }
+
+    // Limite diário global
+    var remainingToday = Infinity;
+    if (MAX_POSTS_PER_DAY > 0) {
+      var dayKey = KEY_DAY_COUNT_PREF + yyyy_mm_dd_(now);
+      var countToday = Number(store.getProperty(dayKey) || '0');
+      remainingToday = Math.max(0, MAX_POSTS_PER_DAY - countToday);
+      if (remainingToday <= 0) {
+        log('Limite diário global atingido. Volte amanhã.');
+        return;
+      }
+    }
+
+    // Seleciona até CAP_PER_RUN em round-robin entre feeds
+    var picks = pickRoundRobinAcrossFeeds_(q, CAP_PER_RUN);
+    if (MAX_POSTS_PER_DAY > 0 && picks.length > remainingToday) {
+      picks = picks.slice(0, remainingToday);
+    }
+    if (!picks.length) { log('Nada selecionado para publicar.'); return; }
+
+    // Remove selecionados da fila (por GUID)
+    removeByGuids(queueLoad(), picks.map(function(it){ return it.guid; }));
+
+    // Publica com pausa curta entre itens
+    var successCount = 0;
+    for (var k = 0; k < picks.length; k++) {
+      var item = picks[k];
+      try {
+        var blogId = resolveBlogId();
+
+        // Materializa HTML agora (fila leve)
+        var postHtml = materializePostHtml_(item);
+        if (!postHtml) {
+          log('Skip sem HTML após materializar:', item.link || item.guid);
+          continue;
+        }
+
+        bloggerCreatePost(blogId, item.title, postHtml, PUBLISH_MODE !== 'publish');
+
+        // marca enviado
+        store.setProperty(KEY_SENT_PREF + item.guid, new Date().toISOString());
+        if (MAX_POSTS_PER_DAY > 0) {
+          var dk = KEY_DAY_COUNT_PREF + yyyy_mm_dd_(Date.now());
+          var c = Number(store.getProperty(dk) || '0') + 1;
+          store.setProperty(dk, String(c));
+        }
+
+        successCount++;
+        if (PER_ITEM_PAUSE_MS > 0) Utilities.sleep(PER_ITEM_PAUSE_MS);
+      } catch (err) {
+        var msg = String(err && err.message || err);
+        if (isQuotaExceeded(msg)) {
+          // Backoff exponencial e repõe o atual + restantes à fila
+          var back = Number(store.getProperty(KEY_BACKOFF_MS) || '0');
+          back = back ? Math.min(back * 2, QUOTA_BACKOFF_MAX_MS) : QUOTA_BACKOFF_START_MS;
+          var until = Date.now() + back;
+          store.setProperty(KEY_BACKOFF_MS, String(back));
+          store.setProperty(KEY_NEXT_ALLOWED, String(until));
+
+          var qNow = queueLoad();
+          var toReturn = picks.slice(k); // inclui o atual
+          queueSave(toReturn.concat(qNow));
+
+          log('quotaExceeded. Backoff de ~' + Math.round(back/60000) + ' min. Repondo ' + toReturn.length + ' itens à fila.');
+          return; // encerra; o relógio chamará depois
+        } else {
+          // erro não-quota → devolve o item e segue
+          log('Falha publicando (não-quota): ' + msg);
+          var qErr = queueLoad();
+          qErr.unshift(item);
+          queueSave(qErr);
+        }
+      }
+    }
+
+    log('Execução concluída. Publicados com sucesso:', successCount);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ===================== SELEÇÃO (ROUND-ROBIN ENTRE FEEDS) =====================
+function pickRoundRobinAcrossFeeds_(queueArr, cap) {
+  if (!queueArr || !queueArr.length) return [];
+  cap = Math.max(1, Number(cap || 1));
+
+  // Agrupa itens por feed
+  var groups = {}; var order = [];
+  for (var i = 0; i < queueArr.length; i++) {
+    var it = queueArr[i];
+    if (!groups[it.feed]) { groups[it.feed] = []; order.push(it.feed); }
+    groups[it.feed].push(it);
+  }
+
+  // Ponto de rotação para variar o feed inicial entre execuções
+  var store = PropertiesService.getScriptProperties();
+  var startIdx = Number(store.getProperty(KEY_ROTATE_FEED) || '0') % order.length;
+  var feedOrder = order.slice(startIdx).concat(order.slice(0, startIdx));
+
+  // Round-robin pegando 1 de cada feed até bater o CAP
+  var picks = [];
+  var exhausted = false;
+  while (picks.length < cap && !exhausted) {
+    exhausted = true;
+    for (var f = 0; f < feedOrder.length && picks.length < cap; f++) {
+      var feed = feedOrder[f];
+      var bucket = groups[feed];
+      if (bucket && bucket.length) {
+        picks.push(bucket.shift());
+        exhausted = false;
+      }
+    }
+  }
+
+  // atualiza o ponto de rotação
+  store.setProperty(KEY_ROTATE_FEED, String((startIdx + 1) % Math.max(1, order.length)));
+
+  return picks;
+}
+
+// ===================== MATERIALIZAÇÃO DO HTML (feed-first + extrator + FIX IMG + VÍDEOS) =====================
+function materializePostHtml_(item) {
+  // 1) Tenta conteúdo do próprio feed (geralmente mais limpo)
+  var feedContent = tryGetFeedContent_(item);
+  var rawHtml = '';
+  var fromFeed = false;
+  if (feedContent && feedContent.contentHtml) {
+    rawHtml = feedContent.contentHtml;
+    fromFeed = true;
+  } else if (feedContent && feedContent.summaryHtml) {
+    rawHtml = feedContent.summaryHtml;
+    fromFeed = true;
+  } else {
+    // 2) Fallback: baixa a página
+    rawHtml = fetchArticleHtml(item.link) || '';
+  }
+  if (!rawHtml) {
+    log('Nenhum HTML encontrado para:', item.link || item.guid);
+    return '';
+  }
+  log('Raw HTML (de ' + (fromFeed ? 'feed' : 'página') + ') tem img? ' + (/<img/i.test(rawHtml) ? 'Sim' : 'Não') + ' | Link: ' + item.link);
+
+  // 3) Extrai só o corpo principal quando possível
+  var domain = getDomain(item.link);
+  var mainOnly = extractMainFromDomain_(rawHtml, domain) || rawHtml;
+  log('Extração mainOnly para domain ' + domain + ': ' + (mainOnly.length > rawHtml.length ? 'Sucesso (filtrou)' : 'Fallback (sem filtro)') + ' | Length: ' + mainOnly.length);
+
+  // 3.1) NORMALIZA IMAGENS LAZY (data-src → src) e resolve URLs relativas
+  mainOnly = normalizeImages_(mainOnly, item.link);
+  var imgCountAfterNorm = (mainOnly.match(/<img[^>]+>/gi) || []).length;
+  log('Após normalização, tem img? ' + (/<img/i.test(mainOnly) ? 'Sim' : 'Não') + ' | Imagens encontradas: ' + imgCountAfterNorm);
+
+  // 4) Limpeza agressiva (preserva iframes de vídeo e blocos com imagens)
+  var cleaned = cleanContentKeepFull(mainOnly, domain);
+  if (!cleaned) {
+    log('Nenhum conteúdo após limpeza:', item.link || item.guid);
+    return '';
+  }
+  var imgCountAfterClean = (cleaned.match(/<img[^>]+>/gi) || []).length;
+  log('Após limpeza, tem img? ' + (/<img/i.test(cleaned) ? 'Sim' : 'Não') + ' | Imagens restantes: ' + imgCountAfterClean);
+
+  // 5) Forçar extração de imagem da página se não houver imagens no feed
+  if (!/<img/i.test(cleaned) && fromFeed) {
+    log('Sem imagens no feed, tentando página:', item.link);
+    var pageHtml = fetchArticleHtml(item.link) || '';
+    if (pageHtml) {
+      var pageMain = extractMainFromDomain_(pageHtml, domain) || pageHtml;
+      pageMain = normalizeImages_(pageMain, item.link);
+      var imgMatch = pageMain.match(/<img[^>]+src=["'][^"']+["'][^>]*>/gi); // Só imagens com src válido
+      if (imgMatch && imgMatch.length) {
+        log('Imagens encontradas na página:', imgMatch.length);
+        cleaned = imgMatch[0] + '\n' + cleaned; // Adiciona a primeira imagem válida
+      } else {
+        log('Nenhuma imagem válida na página:', item.link);
+      }
+    }
+  }
+
+  // 6) Imagem ou vídeo de abertura compatível com Blogger + rodapé
+  var bodyHtml = ensureLeadFigure(cleaned);
+  var footer = '<hr/>' +
+    '<p><small>Fonte original: <a href="' + htmlAttr(item.link) +
+    '" rel="nofollow noopener" target="_blank">' + htmlText(item.link) +
+    '</a>.</small></p>';
+
+  return bodyHtml + '\n' + footer;
+}
+
+// Busca no feed atual o mesmo item para extrair content/summary
+function tryGetFeedContent_(item) {
+  try {
+    var entries = fetchFeedEntries(item.feed);
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i];
+      var eId = e.id || e.link || '';
+      if (eId && (eId === item.guid || e.link === item.link)) {
+        return { contentHtml: e.contentHtml || '', summaryHtml: e.summaryHtml || '' };
+      }
+    }
+  } catch (e) {
+    log('Erro ao buscar feed content:', e.message);
+  }
+  return null;
+}
+
+// Extrai o "miolo" do artigo por domínio - OTIMIZADO PARA Minuto Barra
+function extractMainFromDomain_(html, domain) {
+  var h = String(html || '');
+  var d = String(domain || '').toLowerCase();
+
+  // 1) WordPress comum (iMaranhão / Domingos Costa / Minuto Barra) - OTIMIZADO
+  if (d.indexOf('minutobarra.com.br') >= 0 || d.indexOf('imaranhao.com.br') >= 0 || d.indexOf('domingoscosta.com.br') >= 0 || /wp-content|wordpress/i.test(h)) {
+    // Classes expandidas para WordPress e temas como Newspaper ou GeneratePress
+    var wp = h.match(/<div[^>]+class=["'][^"']*(entry-content|post-content|td-post-content|content-inner|single-post-content|article-content|main-content|post-body|m-content|article-body|content-text|td-post-content tagdiv-type|post-entry|wp-block-post-content|post-full-content|td-main-content|content-area|entry|post|content-wrapper)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+    if (wp && wp[2]) return '<div' + wp[1] + '>' + wp[2] + '</div>';
+
+    // Fallback específico para Minuto Barra: tenta capturar blocos com imagens
+    if (d.indexOf('minutobarra.com.br') >= 0) {
+      var custom = h.match(/<div[^>]+class=["'][^"']*(td-.*content|m-.*content|post-.*content|content.*|wp-block.*|article.*)[^"']*["'][^>]*>([\s\S]*?(?:<img[^>]+>[\s\S]*?)?)<\/div>/i);
+      if (custom && custom[2]) return '<div' + custom[1] + '>' + custom[2] + '</div>';
+    }
+
+    // Fallback genérico: qualquer div com imagem
+    var imgBlock = h.match(/<div[^>]*>([\s\S]*?<img[^>]+>[\s\S]*?)<\/div>/i);
+    if (imgBlock && imgBlock[1]) return '<div>' + imgBlock[1] + '</div>';
+  }
+
+  // 2) genérico: qualquer <article> ou <div> com conteúdo relevante
+  var generic = h.match(/<article[^>]*>([\s\S]*?(?:<img[^>]+>[\s\S]*?)?)<\/article>/i);
+  if (generic && generic[1]) return '<article' + generic[1] + '</article>';
+  var divWithImg = h.match(/<div[^>]*>([\s\S]*?<img[^>]+>[\s\S]*?)<\/div>/i);
+  if (divWithImg && divWithImg[1]) return '<div' + divWithImg[1] + '</div>';
+
+  return null; // usa limpeza genérica
+}
+
+// ============== FIX DE IMAGENS: lazy → src e URL absoluta ==============
+function normalizeImages_(html, baseUrl) {
+  var h = String(html || '');
+  var imgCountBefore = (h.match(/<img[^>]+>/gi) || []).length;
+  log('Normalizando imagens. Total antes:', imgCountBefore);
+
+  h = h.replace(/<img\b[^>]*>/gi, function(tag) {
+    var src    = getAttr_(tag, 'src');
+    var data1  = getAttr_(tag, 'data-src');
+    var data2  = getAttr_(tag, 'data-lazy-src');
+    var data3  = getAttr_(tag, 'data-original');
+    var data4  = getAttr_(tag, 'data-orig-src');
+    var data5  = getAttr_(tag, 'data-lazy');
+    var data6  = getAttr_(tag, 'data-image-src');
+    var data7  = getAttr_(tag, 'data-lazyload');
+    var data8  = getAttr_(tag, 'data-img-src');
+    var data9  = getAttr_(tag, 'data-default');
+    var srcset = getAttr_(tag, 'srcset') || getAttr_(tag, 'data-srcset');
+
+    // decide a melhor URL da imagem (prioridade: src > data-* > srcset)
+    var chosen = src || data1 || data2 || data3 || data4 || data5 || data6 || data7 || data8 || data9 || firstUrlFromSrcset_(srcset);
+    if (chosen && !/data:image/.test(chosen)) { // Ignora placeholders base64
+      var abs = toAbsoluteUrl_(baseUrl, chosen);
+      tag = setAttr_(tag, 'src', abs);
+      log('Imagem normalizada com sucesso:', abs);
+    } else {
+      log('Imagem descartada (sem src válido ou base64):', tag);
+      return ''; // Remove tags sem src válido
+    }
+
+    // Remover atributos que causam problemas/rigidez
+    tag = removeAttr_(tag, 'srcset');
+    tag = removeAttr_(tag, 'sizes');
+    tag = removeAttr_(tag, 'data-src');
+    tag = removeAttr_(tag, 'data-lazy-src');
+    tag = removeAttr_(tag, 'data-original');
+    tag = removeAttr_(tag, 'data-orig-src');
+    tag = removeAttr_(tag, 'data-lazy');
+    tag = removeAttr_(tag, 'data-image-src');
+    tag = removeAttr_(tag, 'data-srcset');
+    tag = removeAttr_(tag, 'data-lazyload');
+    tag = removeAttr_(tag, 'data-img-src');
+    tag = removeAttr_(tag, 'data-default');
+    tag = removeAttr_(tag, 'width');
+    tag = removeAttr_(tag, 'height');
+    tag = removeAttr_(tag, 'data-recalc-dims');
+    tag = removeAttr_(tag, 'decoding');
+    tag = removeAttr_(tag, 'loading');
+
+    return tag;
+  });
+
+  var imgCountAfter = (h.match(/<img[^>]+>/gi) || []).length;
+  log('Após normalização, total de imagens:', imgCountAfter);
+  return h;
+}
+function firstUrlFromSrcset_(srcset) {
+  if (!srcset) return '';
+  var m = srcset.trim().match(/^([^,\s]+)(?:\s+\d+[wx])?/i);
+  return m ? m[1] : '';
+}
+function toAbsoluteUrl_(base, url) {
+  if (!url) return url;
+  if (/^https?:\/\//i.test(url)) return url;
+  if (/^\/\//.test(url)) return 'https:' + url;
+  try {
+    var origin = getOrigin_(base);
+    if (/^\//.test(url)) return origin + url;
+    var basePath = base.replace(/^https?:\/\/[^/]+/i, '').replace(/[#?].*$/,'');
+    if (!/\/$/.test(basePath)) basePath = basePath.replace(/\/[^/]*$/,'/');
+    return origin + basePath + url;
+  } catch (e) {
+    log('Erro ao resolver URL:', url, e.message);
+    return url;
+  }
+}
+function getOrigin_(u) {
+  var m = String(u||'').match(/^(https?:\/\/[^/]+)/i);
+  return m ? m[1] : '';
+}
+
+// MODIFICAÇÃO PARA VÍDEOS: Função para normalizar iframes de vídeo
+function normalizeVideos_(html) {
+  var h = String(html || '');
+  return h.replace(/<iframe\b[^>]*>/gi, function(tag) {
+    var src = getAttr_(tag, 'src');
+    if (!src) return '';
+
+    // Verifica se é YouTube ou Vimeo
+    if (/youtube\.com|youtu\.be|vimeo\.com/i.test(src)) {
+      // Extrai ID do vídeo para YouTube
+      var videoId = '';
+      if (/youtube\.com|youtu\.be/.test(src)) {
+        var match = src.match(/(?:youtube\.com\/(?:embed\/|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]+)/i);
+        videoId = match ? match[1] : '';
+      }
+      // Para Vimeo ou outros, mantém o iframe, mas normaliza atributos
+      var normalized = '<iframe width="100%" height="315" src="' + htmlAttr(src) +
+        '" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>';
+      if (videoId) {
+        // Para YouTube, prefere link simples para evitar problemas de embed
+        return '<p><a href="https://www.youtube.com/watch?v=' + htmlAttr(videoId) +
+          '" target="_blank">Assista ao vídeo no YouTube</a></p>\n' + normalized;
+      }
+      return '<p>' + normalized + '</p>';
+    }
+    return ''; // Remove outros iframes
+  });
+}
+
+// ======== HELPERS DE ATRIBUTOS ========
+function getAttr_(tag, name) {
+  var re = new RegExp('\\s' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i');
+  var m = re.exec(tag);
+  return m ? (m[1] || m[2] || m[3] || '') : '';
+}
+function setAttr_(tag, name, value) {
+  tag = removeAttr_(tag, name);
+  var gt = tag.lastIndexOf('>');
+  if (gt < 0) return tag;
+  var insertPos = gt;
+  if (tag.charAt(gt - 1) === '/') {
+    insertPos = gt - 1;
+  }
+  return tag.slice(0, insertPos) + ' ' + name + '="' + htmlAttr(value) + '"' + tag.slice(insertPos);
+}
+function removeAttr_(tag, name) {
+  var re = new RegExp('\\s' + name + '\\s*=\\s*(?:"[^"]*"|\'[^\']*\'|[^\\s>]+)', 'gi');
+  return tag.replace(re, '');
+}
+
+// ===================== BLOGGER-FRIENDLY LEAD IMAGE OU VÍDEO =====================
+function ensureLeadFigure(bodyHtml) {
+  if (!bodyHtml) return bodyHtml;
+
+  // 1) Prioriza a primeira <img ...>
+  var imgMatch = /<img\b[^>]*>/i.exec(bodyHtml);
+  if (imgMatch) {
+    var originalImg = imgMatch[0];
+    var src = getAttr_(originalImg, 'src');
+    if (src && !/data:image/.test(src)) { // Ignora imagens base64
+      var safeImg = '<img src="' + htmlAttr(src) + '" style="max-width:100%;height:auto;width:100%;">';
+      var lead = '<p>' + safeImg + '</p>';
+      var rest = bodyHtml.replace(originalImg, '');
+      log('Imagem de lead usada:', src);
+      return lead + '\n' + rest;
+    }
+  }
+
+  // 2) Se não houver imagem, tenta usar um iframe de vídeo como lead
+  var iframeMatch = /<iframe\b[^>]*src=["'][^"']*(youtube\.com|youtu\.be|vimeo\.com)[^"']*["'][^>]*>/i.exec(bodyHtml);
+  if (iframeMatch) {
+    var originalIframe = iframeMatch[0];
+    var src = getAttr_(originalIframe, 'src');
+    if (src) {
+      var videoId = '';
+      if (/youtube\.com|youtu\.be/.test(src)) {
+        var match = src.match(/(?:youtube\.com\/(?:embed\/|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]+)/i);
+        videoId = match ? match[1] : '';
+      }
+      var lead = videoId
+        ? '<p><a href="https://www.youtube.com/watch?v=' + htmlAttr(videoId) +
+          '" target="_blank">Assista ao vídeo no YouTube</a></p>'
+        : '<p><iframe width="100%" height="315" src="' + htmlAttr(src) +
+          '" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></p>';
+      var rest = bodyHtml.replace(originalIframe, '');
+      log('Vídeo de lead usado:', src);
+      return lead + '\n' + rest;
+    }
+  }
+
+  // 3) Fallback: imagem padrão se não houver imagem nem vídeo
+  var defaultSrc = 'https://example.com/imagem-padrao.jpg'; // Substitua por uma URL real
+  log('Nenhuma imagem/vídeo encontrado, usando imagem padrão:', defaultSrc);
+  return '<p><img src="' + htmlAttr(defaultSrc) + '" style="max-width:100%;height:auto;width:100%;"></p>\n' + bodyHtml;
+}
+
+// ===================== BLOGGER REST =====================
+function resolveBlogId() {
+  if (BLOG_ID) return BLOG_ID;
+  if (BLOG_URL) {
+    var r = fetchBlogger('/blogs/byurl', 'get', { url: BLOG_URL }, null);
+    if (r && r.id) return r.id;
+  }
+  throw new Error('Defina BLOG_ID ou BLOG_URL');
+}
+function bloggerCreatePost(blogId, title, html, asDraft) {
+  var params = asDraft ? { isDraft: true } : null;
+  var body = { title: title, content: html };
+  return fetchBlogger('/blogs/' + blogId + '/posts/', 'post', params, body);
+}
+function fetchBlogger(path, method, params, body) {
+  var token = ScriptApp.getOAuthToken();
+  var qs = '';
+  if (params) {
+    var parts = [];
+    for (var k in params) if (Object.prototype.hasOwnProperty.call(params,k)) {
+      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+    }
+    qs = parts.length ? '?' + parts.join('&') : '';
+  }
+  var url = BLOGGER_API_BASE + path + qs;
+  var opts = {
+    method: (method || 'get').toUpperCase(),
+    muteHttpExceptions: true,
+    headers: { Authorization: 'Bearer ' + token },
+    contentType: 'application/json'
+  };
+  if (body && /post|put|patch/i.test(opts.method)) opts.payload = JSON.stringify(body);
+
+  var res = UrlFetchApp.fetch(url, opts);
+  var code = res.getResponseCode();
+  var text = res.getContentText();
+  if (code >= 200 && code < 300) return text ? JSON.parse(text) : {};
+  throw new Error('Blogger REST ' + opts.method + ' ' + path + ' → ' + code + ': ' + text);
+}
+
+// ===================== RSS / FEED =====================
+function fetchFeedEntries(feedUrl) {
+  var res = UrlFetchApp.fetch(feedUrl, { muteHttpExceptions: true, followRedirects: true });
+  var text = res.getContentText();
+
+  try {
+    var xml = XmlService.parse(text);
+    var root = xml.getRootElement();
+
+    // RSS 2.0
+    if (root.getName().toLowerCase() === 'rss') {
+      var channel = root.getChild('channel');
+      var items = channel.getChildren('item');
+      var nsContent = XmlService.getNamespace('http://purl.org/rss/1.0/modules/content/');
+      var out = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var contentNode = it.getChild('encoded', nsContent);
+        out.push({
+          title: it.getChildText('title') || '',
+          link: it.getChildText('link') || '',
+          id: it.getChildText('guid') || it.getChildText('link') || '',
+          publishedAt: it.getChildText('pubDate') || '',
+          contentHtml: contentNode ? contentNode.getText() : '',
+          summaryHtml: it.getChildText('description') || ''
+        });
+      }
+      return out;
+    }
+
+    // ATOM
+    if (root.getName().toLowerCase() === 'feed') {
+      var nsAtom = XmlService.getNamespace('http://www.w3.org/2005/Atom');
+      var entries = root.getChildren('entry', nsAtom);
+      var outA = [];
+      for (var j = 0; j < entries.length; j++) {
+        var en = entries[j];
+        var links = en.getChildren('link', nsAtom);
+        var href = '';
+        for (var k = 0; k < links.length; k++) {
+          var relAttr = links[k].getAttribute('rel');
+          var rel = relAttr ? relAttr.getValue() : '';
+          if (rel === 'alternate' || href === '') {
+            var h = links[k].getAttribute('href');
+            if (h) href = h.getValue();
+          }
+        }
+        outA.push({
+          title: getTextNS(en, 'title', nsAtom),
+          link: href,
+          id: getTextNS(en, 'id', nsAtom) || href,
+          publishedAt: getTextNS(en, 'updated', nsAtom) || getTextNS(en, 'published', nsAtom),
+          contentHtml: getTextNS(en, 'content', nsAtom) || '',
+          summaryHtml: getTextNS(en, 'summary', nsAtom) || ''
+        });
+      }
+      return outA;
+    }
+  } catch (e) {
+    log('Erro ao parsear feed:', feedUrl, e.message);
+  }
+
+  // JSON Feed simples
+  try {
+    var obj = JSON.parse(text);
+    if (obj.items && obj.items.length) {
+      var outJ = [];
+      for (var m = 0; m < obj.items.length; m++) {
+        var itJ = obj.items[m];
+        outJ.push({
+          title: itJ.title,
+          link: itJ.url || itJ.link,
+          id: itJ.id || itJ.url || itJ.link,
+          publishedAt: itJ.date_published || '',
+          contentHtml: itJ.content_html || '',
+          summaryHtml: itJ.summary || ''
+        });
+      }
+      return outJ;
+    }
+  } catch (e2) {
+    log('Erro ao parsear JSON feed:', feedUrl, e2.message);
+  }
+  return [];
+}
+function getTextNS(parent, name, ns) {
+  var el = parent.getChild(name, ns);
+  return el ? el.getText() : '';
+}
+
+// ===================== LIMPEZA / FORMATAÇÃO (agressiva, preservando vídeos e imagens) =====================
+function fetchArticleHtml(url) {
+  try {
+    var r = UrlFetchApp.fetch(url, { followRedirects: true, muteHttpExceptions: true });
+    if (r.getResponseCode() >= 200 && r.getResponseCode() < 400) return r.getContentText();
+  } catch (e) {
+    log('Erro ao buscar HTML:', url, e.message);
+  }
+  return '';
+}
+
+function cleanContentKeepFull(html, sourceDomain) {
+  if (!html) return '';
+
+  var h = String(html);
+
+  // Preserva blocos com imagens antes da limpeza
+  var imgBlocks = h.match(/<div[^>]*>[\s\S]*?<img[^>]+>[\s\S]*?</div>/gi) || [];
+  log('Blocos com imagens preservados:', imgBlocks.length);
+
+  // remove comentários/scripts/styles/forms/ins
+  h = h
+    .replace(/<!--[\s\S]*?-->/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<form[\s\S]*?<\/form>/gi, '')
+    .replace(/<ins[\s\S]*?<\/ins>/gi, '');
+
+  // MODIFICAÇÃO PARA VÍDEOS: Preserva iframes de YouTube/Vimeo antes de remover outros
+  h = normalizeVideos_(h);
+  // Remove iframes que não foram normalizados (não são YouTube/Vimeo)
+  h = h.replace(/<iframe[\s\S]*?(?!youtube\.com|youtu\.be|vimeo\.com)[\s\S]*?<\/iframe>/gi, '');
+
+  // remove divs de publicidade/recomendação/cookies/social/newsletter/widgets, exceto se contiverem imagens
+  h = h.replace(/<div[^>]*class=["'][^"']*(ad|ads|publicidade|publicity|banner|anuncio|gpt|teads|m-banner|advert|sponsored|outbrain|taboola|share|social|newsletter|subscribe|coment|comment|disqus|related|relacionadas|veja-tambem|veja_tambem|sidebar|widget|recommended|pop-up|popup|modal|cookies)[^"']*["'][^>]*>(?![\s\S]*?<img[^>]+>)[\s\S]*?<\/div>/gi, '');
+
+  // remove blocos iniciados por headings típicos
+  h = stripBlocksByHeading_(h, [
+    'veja também', 'veja tambem', 'mais lidas', 'mais do g1', 'veja mais',
+    'siga', 'siga-nos', 'newsletter', 'compartilhe', 'comentários', 'comentarios',
+    'relacionadas', 'relacionado', 'recomendado'
+  ]);
+
+  // unwrap de imagem/vídeo dentro de anchor e remoção de anchors
+  h = h.replace(/<a[^>]*>\s*(<img[^>]+>|<iframe[^>]+>)\s*<\/a>/gi, '$1');
+  h = h.replace(/<a[^>]*>([\s\S]*?)<\/a>/gi, '$1');
+
+  // remove handlers on*
+  h = h.replace(/\son\w+="[^"]*"/gi, '').replace(/\son\w+='[^']*'/gi, '');
+
+  // Removemos srcset/sizes residuais
+  h = h.replace(/\s(srcset|sizes)=["'][^"']*["']/gi, '');
+
+  // normaliza espaços/linhas
+  h = h.replace(/\n{3,}/g, '\n\n').replace(/\s{2,}/g, ' ');
+
+  // Reinsere blocos com imagens preservados
+  if (imgBlocks.length) {
+    h = imgBlocks.join('\n') + '\n' + h;
+  }
+
+  return h.trim();
+}
+
+function stripBlocksByHeading_(html, labels) {
+  var h = String(html);
+  for (var i = 0; i < labels.length; i++) {
+    var lbl = labels[i]
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/\s+/g, '\\s*');
+    var re = new RegExp(
+      '<(section|div)[\\s\\S]*?(<h[1-6][^>]*>[^<]*' + lbl + '[\\s\\S]*?</h[1-6]>)[\\s\\S]*?</(section|div)>',
+      'gi'
+    );
+    h = h.replace(re, '');
+  }
+  return h;
+}
+
+// ===================== FILA (leve) =====================
+function queueLoad() {
+  var raw = PropertiesService.getScriptProperties().getProperty(KEY_QUEUE) || '[]';
+  try { var arr = JSON.parse(raw); if (Array.isArray(arr)) return arr; } catch(e) {
+    log('Erro ao carregar fila:', e.message);
+  }
+  return [];
+}
+function queueSave(arr) {
+  PropertiesService.getScriptProperties().setProperty(KEY_QUEUE, JSON.stringify(arr || []));
+}
+function queuePush(item) {
+  var q = queueLoad();
+  q.push(item);
+
+  // aplica teto global (mantém os mais recentes)
+  if (q.length > QUEUE_MAX_ITEMS) {
+    q = q.slice(q.length - QUEUE_MAX_ITEMS);
+  }
+  queueSave(q);
+}
+function queueHas(guid) {
+  var q = queueLoad();
+  for (var i = 0; i < q.length; i++) if (q[i].guid === guid) return true;
+  return false;
+}
+function removeByGuids(queueArr, guids) {
+  var q = Array.isArray(queueArr) ? queueArr : queueLoad();
+  if (!guids || !guids.length) return;
+  var set = {}; for (var i = 0; i < guids.length; i++) set[guids[i]] = true;
+  var out = []; for (var j = 0; j < q.length; j++) if (!set[q[j].guid]) out.push(q[j]);
+  queueSave(out);
+}
+function queueSize() { return queueLoad().length; }
+
+// ===================== UTIL =====================
+function isQuotaExceeded(errMsg) {
+  errMsg = String(errMsg || '').toLowerCase();
+  return errMsg.indexOf('quotaexceeded') >= 0 ||
+         errMsg.indexOf("you've reached the limit for creating posts") >= 0 ||
+         errMsg.indexOf('"reason":"quotaexceeded"') >= 0;
+}
+function tryLock(lock, ms) {
+  var start = Date.now(); var wait = 100;
+  while (!lock.tryLock(wait)) {
+    if (Date.now() - start > ms) return false;
+    wait = Math.min(wait * 2, 2000);
+  }
+  return true;
+}
+function log() {
+  var a = Array.prototype.slice.call(arguments);
+  Logger.log(new Date().toISOString() + ' | ' + a.join(' '));
+}
+function getDomain(url) {
+  return String(url||'').replace(/^https?:\/\//i,'').split('/')[0].toLowerCase();
+}
+function htmlAttr(s) { return String(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+function htmlText(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function safeTitle(t) { return String(t||'').trim(); }
+function yyyy_mm_dd_(ms) {
+  var d = new Date(ms);
+  return d.getFullYear() + '-' + ('0'+(d.getMonth()+1)).slice(-2) + '-' + ('0'+d.getDate()).slice(-2);
+}
+
+/* ===================== MANUTENÇÃO / LIMPEZA OPCIONAL ===================== */
+function clearQueueStorage() {
+  PropertiesService.getScriptProperties().deleteProperty(KEY_QUEUE);
+  Logger.log('Fila limpa. Reenfileire com enqueueFromFeeds().');
+}
+
+function purgeOldSent(keepDays, hardCap) {
+  keepDays = keepDays || 14;
+  hardCap  = hardCap  || 5000;
+
+  var store = PropertiesService.getScriptProperties();
+  var keys  = store.getKeys() || [];
+  var cutoff = Date.now() - keepDays * 24 * 60 * 60 * 1000;
+
+  var sentItems = [];
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i];
+    if (k.indexOf(KEY_SENT_PREF) === 0) {
+      var iso = store.getProperty(k) || '';
+      var t = Date.parse(iso);
+      if (isFinite(t)) sentItems.push({ key: k, ts: t });
+      else store.deleteProperty(k);
+    }
+  }
+
+  for (var j = 0; j < sentItems.length; j++) {
+    if (sentItems[j].ts < cutoff) {
+      store.deleteProperty(sentItems[j].key);
+      sentItems[j].deleted = true;
+    }
+  }
+
+  var remaining = sentItems.filter(function(x){ return !x.deleted; });
+  remaining.sort(function(a,b){ return b.ts - a.ts; });
+  if (remaining.length > hardCap) {
+    for (var z = hardCap; z < remaining.length; z++) {
+      store.deleteProperty(remaining[z].key);
+    }
+  }
+
+  Logger.log('purgeOldSent: mantidos ~%s, antigos removidos.', Math.min(hardCap, remaining.length));
+}
+
+function resetCooldown() {
+  var store = PropertiesService.getScriptProperties();
+  store.deleteProperty(KEY_NEXT_ALLOWED);
+  store.deleteProperty(KEY_BACKOFF_MS);
+  Logger.log('Cooldown resetado.');
+}
